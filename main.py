@@ -2,8 +2,10 @@ import os
 import pandas as pd
 import duckdb
 import json
+from datetime import datetime
 from dotenv import load_dotenv
 from typing import Optional, Dict, List, Any
+from langchain.callbacks.base import BaseCallbackHandler
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langchain_openai import ChatOpenAI
@@ -28,26 +30,68 @@ class TikTokState(BaseModel):
     retry_count: int = Field(default=0, description="采样重试次数")
     max_retry: int = Field(default=3, description="最大重试上限，避免无限循环")
     eval_score: Optional[Dict] = None
+    # 在TikTokState里面追加
+    prompt_tokens_total: int = 0
+    completion_tokens_total: int = 0
+    token_detail: list[Dict[str, Any]] = []  # 存储每个节点的token明细
+
+
+class TokenCountCallback(BaseCallbackHandler):
+    def __init__(self, node_name: str):
+        self.node_name = node_name
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+
+    def on_llm_end(self, response, **kwargs):
+        usage = response.llm_output.get("token_usage", {})
+        self.prompt_tokens += usage.get("prompt_tokens", 0)
+        self.completion_tokens += usage.get("completion_tokens", 0)
+
 
 def save_run_log_node(state: TikTokState) -> Dict:
     conn = duckdb.connect("./tiktok.duckdb")
     # python侧生成run_id
     res = conn.execute("SELECT COALESCE(MAX(run_id),0)+1 FROM dwd_agent_run_log").fetchone()
     run_id = res[0]
-
     conn.execute("""
-        INSERT INTO dwd_agent_run_log(
-            run_id, sample_cnt, raw_samples_json, parsed_contents_json,
-            llm_industry_raw, llm_growth_raw
-        ) VALUES (?, ?, ?, ?, ?, ?)
-    """,[
-        run_id,
-        len(state.raw_samples),
-        json.dumps(state.raw_samples, ensure_ascii=False),
-        json.dumps(state.parsed_contents, ensure_ascii=False),
-        state.industry_insight,
-        state.growth_suggestion
-    ])
+INSERT INTO dwd_agent_run_log(
+    run_id, run_timestamp, sample_cnt, raw_samples_json, parsed_contents_json,
+    llm_industry_raw, llm_growth_raw,
+    prompt_tokens_total, completion_tokens_total, token_detail_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (
+    run_id,
+    datetime.now(),
+    len(state.raw_samples),
+    json.dumps(state.raw_samples, ensure_ascii=False),
+    json.dumps(state.parsed_contents, ensure_ascii=False),
+    state.industry_insight,
+    state.growth_suggestion,
+    state.prompt_tokens_total,
+    state.completion_tokens_total,
+    json.dumps(state.token_detail, ensure_ascii=False)
+))
+
+    print(f"\n📊 Token统计：")
+    print(f"总输入token：{state.prompt_tokens_total}")
+    print(f"总输出token：{state.completion_tokens_total}")
+    # 简单成本估算，按gpt-3.5-turbo价格举例，你可以改成你用的模型单价
+    cost = state.prompt_tokens_total / 1000 * 0.0015 + state.completion_tokens_total /1000 *0.002
+    print(f"💸 本次估算成本：${cost:.4f}")
+
+    #conn.execute("""
+    #    INSERT INTO dwd_agent_run_log(
+    #        run_id, sample_cnt, raw_samples_json, parsed_contents_json,
+    #        llm_industry_raw, llm_growth_raw
+    #    ) VALUES (?, ?, ?, ?, ?, ?)
+    #""",[
+    #    run_id,
+    #    len(state.raw_samples),
+    #    json.dumps(state.raw_samples, ensure_ascii=False),
+    #    json.dumps(state.parsed_contents, ensure_ascii=False),
+    #    state.industry_insight,
+    #    state.growth_suggestion
+    #])
     conn.close()
     return {"current_run_id": run_id}
 
@@ -110,7 +154,10 @@ def init_agent_tables():
         raw_samples_json TEXT,
         parsed_contents_json TEXT,
         llm_industry_raw TEXT,
-        llm_growth_raw TEXT
+        llm_growth_raw TEXT,
+        prompt_tokens_total INTEGER,
+        completion_tokens_total INTEGER,
+        token_detail_json TEXT
     )
     """)
     # Agent报告表
@@ -252,8 +299,16 @@ def evaluation_node(state: TikTokState) -> TikTokState:
         insight=state.industry_insight,
         strategy=state.growth_suggestion
     )
-    resp = llm.invoke(prompt).content
-    import json
+    token_cb = TokenCountCallback(node_name="evaluation_node")
+    res = llm.invoke(prompt, config={"callbacks": [token_cb]})
+    resp = res.content
+
+    new_detail = state.token_detail.copy()
+    new_detail.append({
+        "node": "evaluation_node",
+        "prompt": token_cb.prompt_tokens,
+        "completion": token_cb.completion_tokens
+    })
     try:
         score = json.loads(resp)
     except Exception:
@@ -264,7 +319,11 @@ def evaluation_node(state: TikTokState) -> TikTokState:
             "logic_consistency":0,
             "comment":"LLM返回JSON解析失败"
         }
-    return state.model_copy(update={"eval_score": score})
+    return state.model_copy(update={
+        "prompt_tokens_total": state.prompt_tokens_total + token_cb.prompt_tokens,
+        "completion_tokens_total": state.completion_tokens_total + token_cb.completion_tokens,
+        "token_detail": new_detail,
+        "eval_score": score})
 
 
 
@@ -300,8 +359,21 @@ def reflect_node(state: TikTokState) -> TikTokState:
 3. 找出逻辑矛盾、无数据支撑的猜想，直接修正。
 输出修正后的完整Markdown报告，不要额外解释。
 """
-    revised_insight = llm.invoke(prompt).content
-    return state.model_copy(update={"industry_insight": revised_insight})
+    token_cb = TokenCountCallback(node_name="reflect_node")
+    res = llm.invoke(prompt, config={"callbacks": [token_cb]})
+    revised_insight = res.content
+
+    new_detail = state.token_detail.copy()
+    new_detail.append({
+        "node": "reflect_node",
+        "prompt": token_cb.prompt_tokens,
+        "completion": token_cb.completion_tokens
+    })
+    return state.model_copy(update={
+        "prompt_tokens_total": state.prompt_tokens_total + token_cb.prompt_tokens,
+        "completion_tokens_total": state.completion_tokens_total + token_cb.completion_tokens,
+        "token_detail": new_detail,
+        "industry_insight": revised_insight})
 
 def fetch_sample_node(state: TikTokState) -> TikTokState:
     """从DuckDB拉取一批全新样本，排除历史已经采集过的video_id"""
@@ -391,7 +463,15 @@ def parse_data_node(state: TikTokState) -> TikTokState:
 {json.dumps(text_list, ensure_ascii=False)}
 输出仅返回JSON数组，顺序必须和输入一一对应。
 """
-        resp = llm.invoke(prompt)
+        token_cb = TokenCountCallback(node_name="parse_data_node")
+        resp = llm.invoke(prompt, config={"callbacks": [token_cb]})
+
+        new_detail = state.token_detail.copy()
+        new_detail.append({
+            "node": "parse_data_node",
+            "prompt": token_cb.prompt_tokens,
+            "completion": token_cb.completion_tokens
+        })
         raw_text = resp.content.strip()
         # 清理LLM可能输出的```json标记
         if raw_text.startswith("```json"):
@@ -436,6 +516,9 @@ def parse_data_node(state: TikTokState) -> TikTokState:
         "raw_samples": combined_raw,
         "parsed_contents": combined_parsed,
         "new_raw_batch": [],
+        "prompt_tokens_total": state.prompt_tokens_total + token_cb.prompt_tokens,
+        "completion_tokens_total": state.completion_tokens_total + token_cb.completion_tokens,
+        "token_detail": new_detail,
         "sample_pass": False
     })
 
@@ -460,8 +543,20 @@ def industry_analyze_node(state: TikTokState) -> Dict:
 【原始有效视频样本】
 {state.clean_samples}
 """
-    res = llm.invoke(prompt)
-    return {"industry_insight": res.content}
+    token_cb = TokenCountCallback(node_name="industry_analyze_node")
+    res = llm.invoke(prompt, config={"callbacks": [token_cb]})
+
+    new_detail = state.token_detail.copy()
+    new_detail.append({
+        "node": "industry_analyze_node",
+        "prompt": token_cb.prompt_tokens,
+        "completion": token_cb.completion_tokens
+    })
+    return {"industry_insight": res.content,
+        "prompt_tokens_total": state.prompt_tokens_total + token_cb.prompt_tokens,
+        "completion_tokens_total": state.completion_tokens_total + token_cb.completion_tokens,
+        "token_detail": new_detail
+            }
 
 
 
@@ -478,8 +573,20 @@ def growth_strategy_node(state: TikTokState) -> Dict:
 行业分析结论：
 {insight}
 """.format(insight=state.industry_insight)
-    res = llm.invoke(prompt)
-    return {"growth_suggestion": res.content}
+    token_cb = TokenCountCallback(node_name="growth_strategy_node")
+    res = llm.invoke(prompt, config={"callbacks": [token_cb]})
+
+    new_detail = state.token_detail.copy()
+    new_detail.append({
+        "node": "growth_strategy_node",
+        "prompt": token_cb.prompt_tokens,
+        "completion": token_cb.completion_tokens
+    })
+    return {
+        "prompt_tokens_total": state.prompt_tokens_total + token_cb.prompt_tokens,
+        "completion_tokens_total": state.completion_tokens_total + token_cb.completion_tokens,
+        "token_detail": new_detail,
+            "growth_suggestion": res.content}
 
 # ===================== 4.组装LangGraph工作流 =====================
 builder = StateGraph(TikTokState)
